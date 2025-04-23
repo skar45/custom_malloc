@@ -1,15 +1,38 @@
+/*
+ * mm.c - Memory allocator that uses segregated free lists
+ * TODO:
+ * - Free list for different class sizes.
+ * - Defer coalescing to next allocation after calling free.
+ * - Order free list blocks by the address in memory.
+ */
+// fix realloc for the same class size
+// add support for up to 256 byte class size
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "mm.h"
+#include "memlib.h"
+
+team_t team = {
+    "a",
+    "b",
+    "c",
+    "d",
+    "e"
+};
+
 #define PTR_SIZE 8
-#define ALIGNMENT PTR_SIZE
 #define RESERVED (PTR_SIZE * 2)
 #define PAGE_SIZE (1<<12)
 #define GET_CHUNK(size) (PAGE_SIZE / size)
-// 1024 block size
 // 3 reserved for length, footer, list header
+// 1 for alignment
 #define ALLOC_LEN(size) (GET_CHUNK(size) - (PTR_SIZE * 4))
-#define TOTAL_SIZE(size) (GET_CHUNK(size) - PTR_SIZE)
 
 #define MODULO_2(a, b) ((unsigned long)a & (b - 1))
 #define ALIGN(addr, size) ((char *)(MODULO_2(addr, size) == 0 ? (unsigned long)addr: ((unsigned long)addr & ~(size - 1)) + size))
@@ -20,7 +43,7 @@
 #define PUT_LEN(list, length) (PUT(list, length))
 #define GET_START(list) ((char *)GET(list + PTR_SIZE))
 #define PUT_START(list, ptr) (PUT(list + PTR_SIZE, ptr))
-#define GET_FTR(size, list)  (list + (ALLOC_LEN(size)) + (PTR_SIZE * 2))
+#define GET_FTR(size, list)  (list + (ALLOC_LEN(size) * size) + (PTR_SIZE * 2))
 
 #define HEADER_BIG(p, size) (PUT(p, (size  | 0x1)))
 #define FOOTER_BIG(p, size, next) (PUT(p + size + PTR_SIZE, next))
@@ -38,21 +61,15 @@ static char *class48;
 static char *class64;
 static char *classbig;
 
-// -------- mock sbrk -------------
-static char *sbrk;
-
-void *mem_sbrk(size_t size) {
-    char* prev = sbrk;
-    sbrk += size;
-    return (void *)(prev);
+void mm_check(void)
+{
+    size_t heap_size = mem_heapsize();
+    size_t page_size = mem_pagesize();
+    char* start = (char *)mem_heap_lo();
+    char* end = (char *)mem_heap_hi();
+    printf("heap size: %d, page size: %d, heap start: %x, heap end: %x \n", heap_size, page_size, start, end);
 }
 
-static void mem_init() {
-    size_t size = 0;
-    sbrk = (char *)(malloc(PAGE_SIZE * 10));
-}
-
-// --------------------------------
 static size_t get_class(size_t size)
 {
     if (size <= 8) return 8;
@@ -82,7 +99,7 @@ static char** get_class_ptr(size_t class_size)
 }
 
 static void expand_list(char** list, size_t size) {
-    char* alloc = (char *)(mem_sbrk(GET_CHUNK(size)));
+    char* alloc = (char *)(mem_sbrk(PAGE_SIZE));
     size_t alloc_len = ALLOC_LEN(size);
     alloc = ALIGN(alloc, 8);
     char* footer = GET_FTR(size, *list);
@@ -96,11 +113,10 @@ static void expand_list(char** list, size_t size) {
 	char* next = curr + size;
 	PUT(curr, next);
     }
-    // printf("list footer_offset footer %x %d  %x\n", alloc, footer_offset, *footer);
 }
 
 static void create_list(char** list, size_t size) {
-    char* alloc = (char *)(mem_sbrk(GET_CHUNK(size)));
+    char* alloc = (char *)(mem_sbrk(PAGE_SIZE));
     size_t alloc_len = ALLOC_LEN(size);
     alloc = ALIGN(alloc, 8);
     *list = alloc;
@@ -113,14 +129,12 @@ static void create_list(char** list, size_t size) {
 	char* next = curr + size;
 	PUT(curr, next);
     }
-    // printf("list footer_offset footer %x %d  %x\n", *list, footer_offset, *footer);
 }
 
 static char* expand_biglist(char** block_ptr, size_t size) {
     size_t new_size = (size_t)ALIGN(size, 8);
     char* new_block = (char *)(mem_sbrk(new_size + RESERVED));
     new_block = ALIGN(new_block, 8);
-    size_t block_size = GET_SIZE(*block_ptr);
     FOOTER_BIG(*block_ptr, new_size, new_block);
     HEADER_BIG(new_block, new_size);
     FOOTER_BIG(new_block, new_size, 0x00);
@@ -134,10 +148,56 @@ static char* create_biglist(char** block_ptr, size_t size) {
     HEADER_BIG(new_block, new_size);
     FOOTER_BIG(new_block, new_size, 0x00);
     *block_ptr = new_block;
-    size_t block_size = GET_SIZE(*block_ptr);
-    char* next = GET_NEXT(*block_ptr, new_size);
-    printf("classbig %x start %x block %x \n", classbig, *block_ptr + PTR_SIZE, *block_ptr);
     return *block_ptr;
+}
+
+static char* allocate_block(size_t class_size) {
+    if (classbig == NULL) {
+	char* block_ptr = create_biglist(&classbig, class_size);
+	return block_ptr;
+    } else {
+	char* block_ptr = classbig;
+	while (1) {
+	    size_t block_size = GET_SIZE(block_ptr);
+	    if ((block_size >= class_size) && !CHECK_ALLOC(block_ptr)) {
+		SET_ALLOC(block_ptr);
+		return block_ptr;
+	    } else {
+		char* next = GET_NEXT(block_ptr, block_size);
+		if (next == NULL) break;
+		block_ptr = next;
+	    }
+	}
+	char* addr = expand_biglist(&block_ptr, class_size);
+	SET_ALLOC(addr);
+	return addr;
+    }
+}
+
+static char* allocate_free_list(size_t class_size) {
+    char** class_ptr = get_class_ptr(class_size);
+    char* addr = *class_ptr;
+    char* prev;
+    if (addr != NULL) {
+	size_t free_length = (size_t)GET(addr);
+	while (addr) {
+	    if (free_length != 0) {
+		 return addr;
+	    }
+	    prev = addr;
+	    char* footer = (char *)GET(GET_FTR(class_size, addr));
+	    if (footer == NULL) break;
+	    addr = footer;
+	    free_length = (size_t)GET(addr);
+	}
+	expand_list(&prev, class_size);
+	addr = (char *)GET(GET_FTR(class_size, prev));
+	return addr;
+    } else {
+	create_list(class_ptr, class_size);
+	addr = *class_ptr;
+	return addr;
+    }
 }
 
 
@@ -165,55 +225,13 @@ int mm_init(void)
     return 0;
 }
 
-static char* allocate_block(size_t class_size) {
-    if (classbig == NULL) {
-	char* block_ptr = create_biglist(&classbig, class_size);
-	return block_ptr;
-    } else {
-	char* block_ptr = classbig;
-	while (1) {
-	    size_t block_size = GET_SIZE(block_ptr);
-	    if ((block_size >= class_size) && !CHECK_ALLOC(block_ptr)) {
-		SET_ALLOC(block_ptr);
-		return block_ptr;
-	    } else {
-		char* next = GET_NEXT(block_ptr, block_size);
-		if (next == NULL) break;
-		block_ptr = next;
-	    }
-	}
-	char* addr = expand_biglist(&block_ptr, class_size);
-	SET_ALLOC(block_ptr);
-	return addr;
-    }
-}
 
-static char* allocate_free_list(size_t class_size) {
-    char** class_ptr = get_class_ptr(class_size);
-    char* addr = *class_ptr;
-    char* prev;
-    if (addr != NULL) {
-	size_t free_length = (size_t)GET(addr);
-	while (addr) {
-	    if (free_length != 0) {
-		 return addr;
-	    }
-	    prev = addr;
-	    char* footer = (char *)GET(GET_FTR(class_size, addr));
-	    if (footer == NULL) break;
-	    addr = footer;
-	    free_length = (size_t)GET(addr);
-	}
-	expand_list(&prev, class_size);
-	addr = (char *)GET(GET_FTR(class_size, prev));
-	return addr;
-    } else {
-	create_list(class_ptr, class_size);
-	addr = *get_class_ptr(class_size);
-	return addr;
-    }
-}
-
+/**
+    void *mem_heap_lo(void);
+    void *mem_heap_hi(void);
+    size_t mem_heapsize(void);
+    size_t mem_pagesize(void);
+*/
 /* 
  * mm_malloc -
  */
@@ -243,9 +261,12 @@ void mm_free(void *ptr)
 	size_t size = class_sizes[i];
 	while (list) {
 	    size_t length = GET_LEN(list);
-	    if (length == ALLOC_LEN(size)) continue;
-	    char* min_ptr = list + (PTR_SIZE * 2);
 	    char* footer = GET_FTR(size, list);
+	    if (length == ALLOC_LEN(size)) {
+		list = (char *)GET(footer);
+		continue;
+	    };
+	    char* min_ptr = list + (PTR_SIZE * 2);
 	    if ((block >= min_ptr) && (block < footer)) {
 		char* start = GET_START(list);
 		PUT(block, start);
@@ -257,12 +278,13 @@ void mm_free(void *ptr)
 	    list = (char *)GET(footer);
 	}
     }
-
     char* list = classbig;
     while (list) {
-	if (!CHECK_ALLOC(list)) continue;
+	if (!CHECK_ALLOC(list)) {
+	    list = GET_NEXT(list, GET_SIZE(list));
+	    continue;
+	}
 	char* start = list + PTR_SIZE;
-	// printf("list %x start %x block %x \n", list, start, block);
 	if (block == start) {
 	    SET_FREE(list);
 	    return;
@@ -277,9 +299,8 @@ void mm_free(void *ptr)
  * `size` must be a multiple of 8
 **/
 static void copy_data(char* old, char* new, size_t size) {
-    size_t len = size / 8;
-    for (size_t i = 0; i < len; i += 8) {
-	PUT(new + i, old + i);
+    for (size_t i = 0; i < size; i += 8) {
+	PUT(new + i, GET(old + i));
     }
 }
 
@@ -330,53 +351,25 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     // New allocation
-    char* ret_addr;
+    char* new_list;
     size_t new_class_size = get_class(size);
     if (new_class_size > 64) {
-	ret_addr = allocate_block(new_class_size);
+	new_list = allocate_block(new_class_size);
     } else {
-	ret_addr = allocate_free_list(new_class_size);
+	new_list = allocate_free_list(new_class_size);
     }
 
-    // Copy old data into new address and then free old address
-    copy_data(block, ret_addr, prev_class_size);
     if (found_list != NULL) {
+	copy_data(block, GET_START(new_list), prev_class_size);
 	char* start = GET_START(found_list);
 	PUT(block, start);
 	PUT_START(found_list, block);
-	return alloc(ret_addr);
+	return alloc(new_list);
     } else {
+	copy_data(block, new_list + PTR_SIZE, prev_class_size);
 	SET_FREE(old_block);
-	return GET_BLOCK_ADDR(ret_addr);
+	return GET_BLOCK_ADDR(new_list);
     }
 }
 
 
-// sized free lists tests
-// - test interweaving calls with free and allocate
-// - test realloc with alloc
-// - check heap size
-int main() {
-    mm_init();
-    char* ptr = (char *)(mm_malloc(16));
-    for (int i = 0; i < 10; i++) {
-	    printf("iter: %d \n", i);
-	    ptr = mm_malloc(8);
-	    mm_free(ptr);
-	    ptr = mm_malloc(65);
-	    mm_free(ptr);
-	    ptr = mm_malloc(66);
-	    // mm_free(ptr);
-	    ptr = mm_malloc(7);
-	    mm_free(ptr);
-	    // ptr = mm_malloc(32);
-    }
-
-
-    // printf("class8 val %x \n", *(class8 + 8));
-    // printf("class8 %x \n", class8);
-    // printf("class16 ptr %x \n", class16);
-    // printf("class32 ptr %x \n", class32);
-    // printf("class48 ptr %x \n", class48);
-    // printf("global ptr %x \n", classbig);
-}
