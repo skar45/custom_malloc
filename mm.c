@@ -1,12 +1,6 @@
 /*
  * mm.c - Memory allocator that uses segregated free lists
- * TODO:
- * - Free list for different class sizes.
- * - Defer coalescing to next allocation after calling free.
- * - Order free list blocks by the address in memory.
  */
-// fix realloc for the same class size
-// add support for up to 256 byte class size
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -33,18 +27,19 @@ team_t team = {
 // 3 reserved for length, footer, list header
 // 1 for alignment
 #define ALLOC_LEN(size) (GET_CHUNK(size) - (PTR_SIZE * 4))
-
 #define MODULO_2(a, b) ((unsigned long)a & (b - 1))
 #define ALIGN(addr, size) ((char *)(MODULO_2(addr, size) == 0 ? (unsigned long)addr: ((unsigned long)addr & ~(size - 1)) + size))
 #define PUT(p, val) (*(unsigned long *)(p) = ((unsigned long)(val)))
 #define GET(p) (*(unsigned long *)(p))
 
+// Macros for the sized lists
 #define GET_LEN(list) ((size_t)GET(list))
 #define PUT_LEN(list, length) (PUT(list, length))
 #define GET_START(list) ((char *)GET(list + PTR_SIZE))
 #define PUT_START(list, ptr) (PUT(list + PTR_SIZE, ptr))
 #define GET_FTR(size, list)  (list + (ALLOC_LEN(size) * size) + (PTR_SIZE * 2))
 
+// Macros for the big list
 #define HEADER_BIG(p, size) (PUT(p, (size  | 0x1)))
 #define FOOTER_BIG(p, size, next) (PUT(p + size + PTR_SIZE, next))
 #define GET_SIZE(p) ((GET(p) | 0x1) - 0x1)
@@ -200,7 +195,9 @@ static char* allocate_free_list(size_t class_size) {
     }
 }
 
-
+/**
+ * Mark block as allocated
+ */
 static void* alloc(char* listptr) {
     char* alloc_addr = GET_START(listptr);
     size_t length = GET_LEN(listptr);
@@ -226,12 +223,6 @@ int mm_init(void)
 }
 
 
-/**
-    void *mem_heap_lo(void);
-    void *mem_heap_hi(void);
-    size_t mem_heapsize(void);
-    size_t mem_pagesize(void);
-*/
 /* 
  * mm_malloc -
  */
@@ -322,9 +313,12 @@ void *mm_realloc(void *ptr, size_t size)
 	prev_class_size = class_sizes[i];
 	while (list) {
 	    size_t length = GET_LEN(list);
-	    if (length == ALLOC_LEN(prev_class_size)) continue;
-	    char* min_ptr = list + (PTR_SIZE * 2);
 	    char* footer = GET_FTR(prev_class_size, list);
+	    if (length == ALLOC_LEN(prev_class_size)) {
+		list = (char *)GET(footer);
+		continue
+	    };
+	    char* min_ptr = list + (PTR_SIZE * 2);
 	    if ((block >= min_ptr) && (block < footer)) {
 		// Return the same address if the class size hasn't increased
 		if (prev_class_size >= size) return (void *)block;
